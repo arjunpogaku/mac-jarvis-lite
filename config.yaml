@@ -1,0 +1,57 @@
+app:
+  name: "Jarvis Lite"
+  version: "0.2.0"
+  host: "127.0.0.1"
+  port: 1097
+
+llm:
+  provider: "ollama"
+  base_url: "http://localhost:11434"
+  model: "qwen2.5:0.5b"
+  temperature: 0.2
+  max_tokens: 512
+
+safety:
+  tools_require_approval: true
+  shell_enabled: false
+  max_file_read_kb: 100
+  max_search_results: 20
+  allowed_extensions:
+    - ".txt"
+    - ".md"
+    - ".tex"
+    - ".py"
+    - ".json"
+    - ".yaml"
+    - ".yml"
+    - ".csv"
+    - ".log"
+  blocked_path_keywords:
+    - ".ssh"
+    - ".gnupg"
+    - "keychain"
+    - "Library/Keychains"
+    - "Passwords"
+    - "private"
+    - ".env"
+
+paths:
+  allowed_roots:
+    - "~/Documents"
+    - "~/Desktop"
+
+workspaces:
+  research:
+    description: "Research papers, LaTeX files, experiments, and notes"
+    roots:
+      - "~/Documents/Research"
+      - "~/Desktop/Research"
+  jobs:
+    description: "Resumes, cover letters, and job descriptions"
+    roots:
+      - "~/Documents/Jobs"
+  general:
+    description: "General documents and desktop files"
+    roots:
+      - "~/Documents"
+      - "~/Desktop"
