@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Any
+from collections.abc import AsyncIterator
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from backend.config import get_settings
+from backend.config import Settings, get_settings
 from backend.db import init_db, log_interaction
 from backend.llm import OllamaClient
-from backend.config import Settings
 from backend.safety import SafetyError, check_allowed_path, validate_allowed_path
 from backend.tools.file_reader import read_text_file
 from backend.tools.file_search import search_files
@@ -18,7 +19,15 @@ from backend.tools.summarizer import summarize_file
 
 settings = get_settings()
 llm_client = OllamaClient(settings.llm)
-app = FastAPI(title=settings.app.name, version=settings.app.version)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    init_db()
+    yield
+
+
+app = FastAPI(title=settings.app.name, version=settings.app.version, lifespan=lifespan)
 
 
 class ChatRequest(BaseModel):
@@ -94,11 +103,6 @@ class SummarizeFileResponse(BaseModel):
     path: str
     summary: str
     truncated: bool
-
-
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
 
 
 def require_tool_approval(approved: bool) -> None:
