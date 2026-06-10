@@ -100,6 +100,7 @@ def run_pending_tool(pending: dict[str, object]) -> None:
         "search_files": "/tools/search_files",
         "read_file": "/tools/read_file",
         "summarize_file": "/tools/summarize_file",
+        "kb_index_workspace": "/kb/index_workspace",
     }[tool_name]
     payload = dict(pending["payload"])
     payload.update(
@@ -150,6 +151,17 @@ def render_tool_result() -> None:
         if payload["truncated"]:
             st.caption("The file was truncated before summarizing.")
         st.write(payload["summary"])
+    elif kind == "kb_index_workspace":
+        st.write(f"Workspace: `{payload['workspace']}`")
+        st.write(f"Scanned files: `{payload['scanned_file_count']}`")
+        st.write(f"Indexed files: `{payload['indexed_file_count']}`")
+        st.write(f"Skipped unchanged: `{payload['skipped_unchanged_count']}`")
+        st.write(f"Rejected files: `{payload['rejected_file_count']}`")
+        st.write(f"Chunks created: `{payload['total_chunks_created']}`")
+        if payload["errors"]:
+            with st.expander("Rejected files and errors"):
+                for item in payload["errors"]:
+                    st.text(item)
 
 st.set_page_config(page_title="Jarvis Lite", page_icon="J", layout="wide")
 
@@ -175,7 +187,7 @@ with st.sidebar:
     for root in workspace_roots(selected_workspace):
         st.code(root)
 
-    st.caption("Shell tools are disabled in v0.2.")
+    st.caption("Shell tools are disabled in v0.3.")
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = None
@@ -255,5 +267,80 @@ with tools_col:
             describe_safety(summary_path, selected_workspace, is_search=False),
         )
 
-    render_approval()
-    render_tool_result()
+st.header("Knowledge Base")
+st.info("Jarvis will only read approved folders in this workspace. It cannot modify or delete files.")
+
+kb_col, ask_col = st.columns(2)
+with kb_col:
+    st.subheader("Index")
+    st.write(f"Selected workspace: `{selected_workspace}`")
+    if st.button("Index selected workspace"):
+        stage_tool_request(
+            "kb_index_workspace",
+            selected_workspace,
+            "Read approved workspace files into the local SQLite knowledge base.",
+            selected_workspace,
+            {"workspace": selected_workspace},
+            "Allowed after approval: indexing is limited to configured roots for this workspace.",
+            requested_path=selected_workspace,
+        )
+
+    st.subheader("Search")
+    kb_query = st.text_input("Knowledge base query")
+    kb_limit = st.slider("Search result limit", min_value=1, max_value=20, value=10)
+    if st.button("Search knowledge base", disabled=not kb_query):
+        try:
+            response = requests.post(
+                f"{BACKEND_URL}/kb/search",
+                json={"query": kb_query, "workspace": selected_workspace, "limit": kb_limit},
+                timeout=30,
+            )
+            response.raise_for_status()
+            st.session_state.kb_search_result = response.json()
+        except requests.RequestException as exc:
+            st.session_state.kb_search_result = {"error": f"KB search failed: {exc}"}
+
+    kb_search_result = st.session_state.get("kb_search_result")
+    if kb_search_result:
+        if "error" in kb_search_result:
+            st.error(kb_search_result["error"])
+        else:
+            for item in kb_search_result["results"]:
+                line_range = ""
+                if item["start_line"] is not None and item["end_line"] is not None:
+                    line_range = f" lines {item['start_line']}-{item['end_line']}"
+                st.markdown(f"`{item['path']}`{line_range}")
+                st.text(item["snippet"])
+
+with ask_col:
+    st.subheader("Ask")
+    kb_question = st.text_area("Question over indexed files", height=120)
+    ask_limit = st.slider("Context chunks", min_value=1, max_value=10, value=5)
+    if st.button("Ask indexed files", disabled=not kb_question):
+        try:
+            response = requests.post(
+                f"{BACKEND_URL}/kb/ask",
+                json={"question": kb_question, "workspace": selected_workspace, "limit": ask_limit},
+                timeout=90,
+            )
+            response.raise_for_status()
+            st.session_state.kb_ask_result = response.json()
+        except requests.RequestException as exc:
+            st.session_state.kb_ask_result = {"error": f"KB ask failed: {exc}"}
+
+    kb_ask_result = st.session_state.get("kb_ask_result")
+    if kb_ask_result:
+        if "error" in kb_ask_result:
+            st.error(kb_ask_result["error"])
+        else:
+            if kb_ask_result["context_limited"]:
+                st.caption("Context was limited before sending to Ollama.")
+            st.write(kb_ask_result["answer"])
+            st.subheader("Sources Used")
+            if not kb_ask_result["sources_used"]:
+                st.write("No sources retrieved.")
+            for source in kb_ask_result["sources_used"]:
+                st.markdown(f"`{source['path']}`")
+
+render_approval()
+render_tool_result()

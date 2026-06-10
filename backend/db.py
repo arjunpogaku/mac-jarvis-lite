@@ -24,7 +24,52 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 user_message TEXT,
                 assistant_response TEXT,
                 tool_name TEXT,
-                tool_status TEXT NOT NULL
+                tool_status TEXT NOT NULL,
+                workspace TEXT
+            )
+            """
+        )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tool_logs)")}
+        if "workspace" not in columns:
+            conn.execute("ALTER TABLE tool_logs ADD COLUMN workspace TEXT")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS indexed_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace TEXT NOT NULL,
+                path TEXT NOT NULL UNIQUE,
+                file_name TEXT NOT NULL,
+                extension TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                modified_time REAL NOT NULL,
+                content_hash TEXT NOT NULL,
+                indexed_at TEXT NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                start_line INTEGER,
+                end_line INTEGER,
+                FOREIGN KEY(file_id) REFERENCES indexed_files(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts
+            USING fts5(
+                content,
+                path UNINDEXED,
+                workspace UNINDEXED,
+                file_id UNINDEXED,
+                chunk_id UNINDEXED
             )
             """
         )
@@ -48,15 +93,16 @@ def log_interaction(
     assistant_response: str | None,
     tool_name: str | None,
     tool_status: str,
+    workspace: str | None = None,
 ) -> None:
     timestamp = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         conn.execute(
             """
             INSERT INTO tool_logs (
-                timestamp, session_id, user_message, assistant_response, tool_name, tool_status
+                timestamp, session_id, user_message, assistant_response, tool_name, tool_status, workspace
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (timestamp, session_id, user_message, assistant_response, tool_name, tool_status),
+            (timestamp, session_id, user_message, assistant_response, tool_name, tool_status, workspace),
         )

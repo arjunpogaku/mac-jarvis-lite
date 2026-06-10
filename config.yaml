@@ -1,6 +1,6 @@
 app:
   name: "Jarvis Lite"
-  version: "0.2.0"
+  version: "0.3.0"
   host: "127.0.0.1"
   port: 1097
 
@@ -41,6 +41,10 @@ paths:
     - "~/Desktop"
 
 workspaces:
+  kbtest:
+    description: "Small safe Jarvis Lite knowledge-base test folder"
+    roots:
+      - "~/Documents/JarvisKBTest"
   research:
     description: "Research papers, LaTeX files, experiments, and notes"
     roots:

@@ -14,6 +14,7 @@ from backend.llm import OllamaClient
 from backend.safety import SafetyError, check_allowed_path, validate_allowed_path
 from backend.tools.file_reader import read_text_file
 from backend.tools.file_search import search_files
+from backend.tools.indexer import IndexSummary, ask_kb, index_workspace, search_kb
 from backend.tools.summarizer import summarize_file
 
 
@@ -105,6 +106,56 @@ class SummarizeFileResponse(BaseModel):
     truncated: bool
 
 
+class KBIndexRequest(BaseModel):
+    workspace: str
+    approved: bool = False
+
+
+class KBIndexResponse(BaseModel):
+    workspace: str
+    scanned_file_count: int
+    indexed_file_count: int
+    skipped_unchanged_count: int
+    rejected_file_count: int
+    total_chunks_created: int
+    errors: list[str]
+
+
+class KBSearchRequest(BaseModel):
+    query: str = Field(min_length=1)
+    workspace: str
+    limit: int = Field(default=10, ge=1, le=50)
+
+
+class KBSearchResultResponse(BaseModel):
+    path: str
+    file_name: str
+    snippet: str
+    rank: float | None
+    chunk_id: int
+    file_id: int
+    start_line: int | None
+    end_line: int | None
+
+
+class KBSearchResponse(BaseModel):
+    workspace: str
+    query: str
+    results: list[KBSearchResultResponse]
+
+
+class KBAskRequest(BaseModel):
+    question: str = Field(min_length=1)
+    workspace: str
+    limit: int = Field(default=5, ge=1, le=10)
+
+
+class KBAskResponse(BaseModel):
+    answer: str
+    sources_used: list[KBSearchResultResponse]
+    context_limited: bool
+
+
 def require_tool_approval(approved: bool) -> None:
     if settings.safety.tools_require_approval and not approved:
         raise HTTPException(status_code=403, detail="Explicit tool approval is required.")
@@ -113,6 +164,11 @@ def require_tool_approval(approved: bool) -> None:
 def settings_for_workspace(workspace: str | None) -> Settings:
     roots = settings.roots_for_workspace(workspace)
     return settings.with_allowed_roots(roots)
+
+
+def require_valid_workspace(workspace: str) -> None:
+    if workspace not in settings.workspaces:
+        raise HTTPException(status_code=400, detail="Invalid workspace.")
 
 
 def settings_for_requested_search_path(request: SearchRequest) -> tuple[Settings, str, str]:
@@ -265,5 +321,106 @@ async def tool_summarize_file(request: SummarizeFileRequest) -> SummarizeFileRes
             assistant_response=None,
             tool_name="summarize_file",
             tool_status="rejected",
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/kb/index_workspace", response_model=KBIndexResponse)
+async def kb_index_workspace(request: KBIndexRequest) -> KBIndexResponse:
+    require_tool_approval(request.approved)
+    require_valid_workspace(request.workspace)
+    try:
+        summary: IndexSummary = index_workspace(settings, request.workspace)
+        log_interaction(
+            session_id=None,
+            user_message=f"index_workspace:{request.workspace}",
+            assistant_response=(
+                f"indexed={summary.indexed_file_count}; skipped={summary.skipped_unchanged_count}; "
+                f"rejected={summary.rejected_file_count}"
+            ),
+            tool_name="kb_index_workspace",
+            tool_status="ok",
+            workspace=request.workspace,
+        )
+        return KBIndexResponse(**summary.__dict__)
+    except SafetyError as exc:
+        log_interaction(
+            session_id=None,
+            user_message=f"index_workspace:{request.workspace}",
+            assistant_response=None,
+            tool_name="kb_index_workspace",
+            tool_status="rejected",
+            workspace=request.workspace,
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/kb/search", response_model=KBSearchResponse)
+async def kb_search(request: KBSearchRequest) -> KBSearchResponse:
+    require_valid_workspace(request.workspace)
+    try:
+        results = search_kb(
+            query=request.query,
+            workspace=request.workspace,
+            settings=settings,
+            limit=request.limit,
+        )
+        log_interaction(
+            session_id=None,
+            user_message=f"kb_search:{request.query[:120]}",
+            assistant_response=f"{len(results)} results",
+            tool_name="kb_search",
+            tool_status="ok",
+            workspace=request.workspace,
+        )
+        return KBSearchResponse(
+            workspace=request.workspace,
+            query=request.query,
+            results=[KBSearchResultResponse(**result.__dict__) for result in results],
+        )
+    except SafetyError as exc:
+        log_interaction(
+            session_id=None,
+            user_message=f"kb_search:{request.query[:120]}",
+            assistant_response=None,
+            tool_name="kb_search",
+            tool_status="rejected",
+            workspace=request.workspace,
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/kb/ask", response_model=KBAskResponse)
+async def kb_ask(request: KBAskRequest) -> KBAskResponse:
+    require_valid_workspace(request.workspace)
+    try:
+        answer = await ask_kb(
+            question=request.question,
+            workspace=request.workspace,
+            settings=settings,
+            llm=llm_client,
+            limit=request.limit,
+        )
+        log_interaction(
+            session_id=None,
+            user_message=f"kb_ask:{request.question[:120]}",
+            assistant_response=f"sources={len(answer.sources_used)}",
+            tool_name="kb_ask",
+            tool_status="ok",
+            workspace=request.workspace,
+        )
+        return KBAskResponse(
+            answer=answer.answer,
+            sources_used=[KBSearchResultResponse(**source.__dict__) for source in answer.sources_used],
+            context_limited=answer.context_limited,
+        )
+    except SafetyError as exc:
+        log_interaction(
+            session_id=None,
+            user_message=f"kb_ask:{request.question[:120]}",
+            assistant_response=None,
+            tool_name="kb_ask",
+            tool_status="rejected",
+            workspace=request.workspace,
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
