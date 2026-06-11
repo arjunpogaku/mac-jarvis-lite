@@ -11,7 +11,9 @@ def test_config_loads() -> None:
     settings = load_settings(Path("config.yaml"))
     assert settings.app.name == "Jarvis Lite"
     assert settings.app.host == "127.0.0.1"
-    assert settings.app.version == "0.3.0"
+    assert settings.app.version == "0.8.0"
+    assert settings.embeddings.model == "nomic-embed-text"
+    assert settings.knowledge_base.semantic_search_enabled is True
     assert ".md" in settings.safety.allowed_extensions
     assert settings.safety.shell_enabled is False
     assert "research" in settings.workspaces
@@ -28,6 +30,7 @@ def test_health_works() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["name"] == "Jarvis Lite"
-    assert payload["version"] == "0.3.0"
+    assert payload["version"] == "0.8.0"
     assert payload["model"] == "qwen2.5:0.5b"
     assert "workspaces" in payload
+    assert "embeddings" in payload

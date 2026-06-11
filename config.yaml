@@ -1,6 +1,6 @@
 app:
   name: "Jarvis Lite"
-  version: "0.3.0"
+  version: "0.8.0"
   host: "127.0.0.1"
   port: 1097
 
@@ -10,6 +10,18 @@ llm:
   model: "qwen2.5:0.5b"
   temperature: 0.2
   max_tokens: 512
+
+embeddings:
+  provider: "ollama"
+  model: "nomic-embed-text"
+  base_url: "http://localhost:11434"
+  enabled: true
+  vector_dimension: 768
+
+knowledge_base:
+  semantic_search_enabled: true
+  hybrid_search_enabled: true
+  max_embedding_text_chars: 2500
 
 safety:
   tools_require_approval: true

@@ -27,6 +27,20 @@ class LLMConfig(BaseModel):
     max_tokens: int = 512
 
 
+class EmbeddingsConfig(BaseModel):
+    provider: str = "ollama"
+    model: str = "nomic-embed-text"
+    base_url: str = "http://localhost:11434"
+    enabled: bool = True
+    vector_dimension: int = 768
+
+
+class KnowledgeBaseConfig(BaseModel):
+    semantic_search_enabled: bool = True
+    hybrid_search_enabled: bool = True
+    max_embedding_text_chars: int = 2500
+
+
 class SafetyConfig(BaseModel):
     tools_require_approval: bool = True
     shell_enabled: bool = False
@@ -59,6 +73,8 @@ class WorkspaceConfig(BaseModel):
 class Settings(BaseModel):
     app: AppConfig
     llm: LLMConfig
+    embeddings: EmbeddingsConfig = Field(default_factory=EmbeddingsConfig)
+    knowledge_base: KnowledgeBaseConfig = Field(default_factory=KnowledgeBaseConfig)
     safety: SafetyConfig
     paths: PathsConfig
     workspaces: dict[str, WorkspaceConfig] = Field(default_factory=dict)

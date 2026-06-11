@@ -7,10 +7,20 @@ from pathlib import Path
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from backend.config import AppConfig, LLMConfig, PathsConfig, SafetyConfig, Settings, WorkspaceConfig
+from backend.config import (
+    AppConfig,
+    EmbeddingsConfig,
+    KnowledgeBaseConfig,
+    LLMConfig,
+    PathsConfig,
+    SafetyConfig,
+    Settings,
+    WorkspaceConfig,
+)
 from backend.db import init_db
+from backend.embeddings import EmbeddingError
 from backend.safety import SafetyError
-from backend.tools.indexer import ask_kb, index_workspace, search_kb
+from backend.tools.indexer import ask_kb, hybrid_search_kb, index_workspace, search_kb, semantic_search_kb
 from backend.tools.safe_shell import validate_shell_request
 
 
@@ -20,8 +30,10 @@ def make_settings(tmp_path: Path) -> Settings:
     research.mkdir()
     jobs.mkdir()
     return Settings(
-        app=AppConfig(name="Jarvis Lite", version="0.3.0"),
+        app=AppConfig(name="Jarvis Lite", version="0.4.0"),
         llm=LLMConfig(),
+        embeddings=EmbeddingsConfig(enabled=False),
+        knowledge_base=KnowledgeBaseConfig(semantic_search_enabled=False, hybrid_search_enabled=False),
         safety=SafetyConfig(
             shell_enabled=False,
             max_file_read_kb=10,
@@ -35,6 +47,44 @@ def make_settings(tmp_path: Path) -> Settings:
             "jobs": WorkspaceConfig(description="Jobs", roots=[str(jobs)]),
         },
     )
+
+
+def make_semantic_settings(tmp_path: Path) -> Settings:
+    settings = make_settings(tmp_path)
+    return settings.model_copy(
+        update={
+            "embeddings": EmbeddingsConfig(enabled=True, model="test-embed", vector_dimension=2),
+            "knowledge_base": KnowledgeBaseConfig(
+                semantic_search_enabled=True,
+                hybrid_search_enabled=True,
+                max_embedding_text_chars=2500,
+            ),
+        }
+    )
+
+
+class FakeEmbeddingClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def get_embedding(self, text: str) -> list[float]:
+        self.calls.append(text)
+        lowered = text.lower()
+        if "candidate" in lowered or "expansion" in lowered or "reducing" in lowered or "pruning" in lowered:
+            return [1.0, 0.0]
+        if "resume" in lowered or "job" in lowered:
+            return [0.0, 1.0]
+        return [0.5, 0.5]
+
+
+class FailingEmbeddingClient:
+    def get_embedding(self, text: str) -> list[float]:
+        raise EmbeddingError("local embedding model unavailable")
+
+
+def embedding_count(db_path: Path) -> int:
+    with sqlite3.connect(db_path) as conn:
+        return int(conn.execute("SELECT COUNT(*) FROM chunk_embeddings").fetchone()[0])
 
 
 def indexed_paths(db_path: Path) -> list[str]:
@@ -127,6 +177,159 @@ def test_changed_files_are_reindexed(tmp_path: Path) -> None:
     assert second.skipped_unchanged_count == 0
     assert len(results) == 1
     assert "second version" in results[0].snippet
+
+
+def test_indexing_stores_embeddings_for_chunks(tmp_path: Path) -> None:
+    settings = make_semantic_settings(tmp_path)
+    note = tmp_path / "research" / "note.md"
+    note.write_text("PSC-CPM uses pruning to reduce candidate expansion.", encoding="utf-8")
+    db_path = tmp_path / "kb.sqlite"
+    embedder = FakeEmbeddingClient()
+
+    summary = index_workspace(settings, "research", db_path, embedding_client=embedder)  # type: ignore[arg-type]
+
+    assert summary.embeddings_created == 1
+    assert summary.embeddings_skipped == 0
+    assert embedding_count(db_path) == 1
+
+
+def test_unchanged_files_skip_reembedding(tmp_path: Path) -> None:
+    settings = make_semantic_settings(tmp_path)
+    note = tmp_path / "research" / "note.md"
+    note.write_text("PSC-CPM uses pruning to reduce candidate expansion.", encoding="utf-8")
+    db_path = tmp_path / "kb.sqlite"
+    embedder = FakeEmbeddingClient()
+
+    index_workspace(settings, "research", db_path, embedding_client=embedder)  # type: ignore[arg-type]
+    calls_after_first = len(embedder.calls)
+    second = index_workspace(settings, "research", db_path, embedding_client=embedder)  # type: ignore[arg-type]
+
+    assert second.skipped_unchanged_count == 1
+    assert len(embedder.calls) == calls_after_first
+
+
+def test_changed_files_remove_old_embeddings_and_create_new_ones(tmp_path: Path) -> None:
+    settings = make_semantic_settings(tmp_path)
+    note = tmp_path / "research" / "note.md"
+    note.write_text("PSC-CPM uses pruning to reduce candidate expansion.", encoding="utf-8")
+    db_path = tmp_path / "kb.sqlite"
+    embedder = FakeEmbeddingClient()
+
+    index_workspace(settings, "research", db_path, embedding_client=embedder)  # type: ignore[arg-type]
+    note.write_text("Updated PSC-CPM pruning note about reducing candidate expansion.", encoding="utf-8")
+    second = index_workspace(settings, "research", db_path, embedding_client=embedder)  # type: ignore[arg-type]
+
+    assert second.embeddings_created == 1
+    assert embedding_count(db_path) == 1
+
+
+def test_semantic_search_returns_meaningfully_related_result(tmp_path: Path) -> None:
+    settings = make_semantic_settings(tmp_path)
+    note = tmp_path / "research" / "note.md"
+    note.write_text("PSC-CPM uses pruning to reduce candidate expansion.", encoding="utf-8")
+    db_path = tmp_path / "kb.sqlite"
+    embedder = FakeEmbeddingClient()
+    index_workspace(settings, "research", db_path, embedding_client=embedder)  # type: ignore[arg-type]
+
+    outcome = semantic_search_kb(
+        query="reducing candidate expansion",
+        workspace="research",
+        settings=settings,
+        db_path=db_path,
+        embedding_client=embedder,  # type: ignore[arg-type]
+    )
+
+    assert outcome.search_mode_used == "semantic"
+    assert outcome.results
+    assert outcome.results[0].semantic_score == pytest.approx(1.0)
+    assert outcome.results[0].file_name == "note.md"
+
+
+def test_semantic_search_respects_workspace_restriction(tmp_path: Path) -> None:
+    settings = make_semantic_settings(tmp_path)
+    research_note = tmp_path / "research" / "note.md"
+    jobs_note = tmp_path / "jobs" / "job.md"
+    research_note.write_text("PSC-CPM uses pruning to reduce candidate expansion.", encoding="utf-8")
+    jobs_note.write_text("PSC-CPM uses pruning to reduce candidate expansion.", encoding="utf-8")
+    db_path = tmp_path / "kb.sqlite"
+    embedder = FakeEmbeddingClient()
+    index_workspace(settings, "research", db_path, embedding_client=embedder)  # type: ignore[arg-type]
+    index_workspace(settings, "jobs", db_path, embedding_client=embedder)  # type: ignore[arg-type]
+
+    outcome = semantic_search_kb(
+        query="reducing candidate expansion",
+        workspace="jobs",
+        settings=settings,
+        db_path=db_path,
+        embedding_client=embedder,  # type: ignore[arg-type]
+    )
+
+    assert outcome.results
+    assert all("/jobs/" in result.path for result in outcome.results)
+
+
+def test_hybrid_search_removes_duplicate_chunks(tmp_path: Path) -> None:
+    settings = make_semantic_settings(tmp_path)
+    note = tmp_path / "research" / "note.md"
+    note.write_text("PSC-CPM pruning reduces candidate expansion.", encoding="utf-8")
+    db_path = tmp_path / "kb.sqlite"
+    embedder = FakeEmbeddingClient()
+    index_workspace(settings, "research", db_path, embedding_client=embedder)  # type: ignore[arg-type]
+
+    outcome = hybrid_search_kb(
+        query="PSC-CPM pruning candidate expansion",
+        workspace="research",
+        settings=settings,
+        db_path=db_path,
+        embedding_client=embedder,  # type: ignore[arg-type]
+    )
+
+    chunk_ids = [result.chunk_id for result in outcome.results]
+    assert outcome.search_mode_used == "hybrid"
+    assert len(chunk_ids) == len(set(chunk_ids))
+
+
+def test_kb_ask_uses_hybrid_search_when_enabled(tmp_path: Path) -> None:
+    settings = make_semantic_settings(tmp_path)
+    note = tmp_path / "research" / "note.md"
+    note.write_text("PSC-CPM pruning reduces candidate expansion.", encoding="utf-8")
+    db_path = tmp_path / "kb.sqlite"
+    embedder = FakeEmbeddingClient()
+    index_workspace(settings, "research", db_path, embedding_client=embedder)  # type: ignore[arg-type]
+
+    answer = asyncio.run(
+        ask_kb(
+            question="Where did I write about PSC-CPM pruning?",
+            workspace="research",
+            settings=settings,
+            llm=FakeLLM(),  # type: ignore[arg-type]
+            db_path=db_path,
+            embedding_client=embedder,  # type: ignore[arg-type]
+        )
+    )
+
+    assert answer.search_mode_used == "hybrid"
+    assert answer.sources_used
+
+
+def test_fallback_to_keyword_search_when_embeddings_fail(tmp_path: Path) -> None:
+    settings = make_semantic_settings(tmp_path)
+    note = tmp_path / "research" / "note.md"
+    note.write_text("PSC-CPM pruning reduces candidate expansion.", encoding="utf-8")
+    db_path = tmp_path / "kb.sqlite"
+    index_workspace(settings, "research", db_path, embedding_client=FailingEmbeddingClient())  # type: ignore[arg-type]
+
+    outcome = semantic_search_kb(
+        query="PSC-CPM pruning",
+        workspace="research",
+        settings=settings,
+        db_path=db_path,
+        embedding_client=FailingEmbeddingClient(),  # type: ignore[arg-type]
+    )
+
+    assert outcome.search_mode_used == "keyword"
+    assert outcome.fallback_message is not None
+    assert outcome.results
 
 
 def test_fts_search_returns_expected_result(tmp_path: Path) -> None:
@@ -238,3 +441,6 @@ def test_init_db_creates_kb_tables(tmp_path: Path) -> None:
     assert "indexed_files" in names
     assert "document_chunks" in names
     assert "document_chunks_fts" in names
+    assert "chunk_embeddings" in names
+    assert "file_summaries" in names
+    assert "workspace_summaries" in names

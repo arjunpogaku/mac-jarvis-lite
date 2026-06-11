@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -9,6 +11,7 @@ from pathlib import Path
 
 from backend.config import Settings
 from backend.db import DB_PATH, init_db
+from backend.embeddings import EmbeddingError, OllamaEmbeddingClient
 from backend.llm import OllamaClient
 from backend.safety import SafetyError, contains_blocked_keyword, is_under_root, max_read_bytes, validate_allowed_path
 
@@ -25,6 +28,9 @@ class IndexSummary:
     skipped_unchanged_count: int = 0
     rejected_file_count: int = 0
     total_chunks_created: int = 0
+    embeddings_created: int = 0
+    embeddings_skipped: int = 0
+    embedding_errors: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -38,6 +44,8 @@ class KBSearchResult:
     file_id: int
     start_line: int | None
     end_line: int | None
+    semantic_score: float | None = None
+    combined_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -45,6 +53,14 @@ class KBAnswer:
     answer: str
     sources_used: list[KBSearchResult]
     context_limited: bool
+    search_mode_used: str = "keyword"
+
+
+@dataclass(frozen=True)
+class SemanticSearchOutcome:
+    results: list[KBSearchResult]
+    search_mode_used: str
+    fallback_message: str | None = None
 
 
 def settings_for_workspace_name(settings: Settings, workspace: str) -> Settings:
@@ -142,12 +158,15 @@ def _replace_indexed_file(
     path: Path,
     text: str,
     content_hash: str,
-) -> int:
+    settings: Settings,
+    embedding_client: OllamaEmbeddingClient | None,
+) -> tuple[int, int, int, list[str]]:
     stat = path.stat()
     now = datetime.now(timezone.utc).isoformat()
     existing = _existing_file(conn, str(path))
     if existing:
         file_id = int(existing["id"])
+        conn.execute("DELETE FROM chunk_embeddings WHERE file_id = ?", (file_id,))
         conn.execute("DELETE FROM document_chunks_fts WHERE file_id = ?", (str(file_id),))
         conn.execute("DELETE FROM document_chunks WHERE file_id = ?", (file_id,))
         conn.execute(
@@ -193,6 +212,9 @@ def _replace_indexed_file(
         file_id = int(cursor.lastrowid)
 
     chunks = chunk_text(text)
+    embeddings_created = 0
+    embeddings_skipped = 0
+    embedding_errors: list[str] = []
     for chunk_index, (content, start_line, end_line) in enumerate(chunks):
         cursor = conn.execute(
             """
@@ -210,13 +232,47 @@ def _replace_indexed_file(
             (content, str(path), workspace, str(file_id), str(chunk_id)),
         )
 
-    return len(chunks)
+        if not settings.embeddings.enabled or embedding_client is None:
+            embeddings_skipped += 1
+            continue
+        try:
+            vector = embedding_client.get_embedding(content)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO chunk_embeddings (
+                    chunk_id, file_id, workspace, embedding_model, vector_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chunk_id,
+                    file_id,
+                    workspace,
+                    settings.embeddings.model,
+                    json.dumps(vector),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            embeddings_created += 1
+        except EmbeddingError as exc:
+            embeddings_skipped += 1
+            embedding_errors.append(f"{path}: chunk {chunk_index}: {exc}")
+
+    return len(chunks), embeddings_created, embeddings_skipped, embedding_errors
 
 
-def index_workspace(settings: Settings, workspace: str, db_path: Path = DB_PATH) -> IndexSummary:
+def index_workspace(
+    settings: Settings,
+    workspace: str,
+    db_path: Path = DB_PATH,
+    embedding_client: OllamaEmbeddingClient | None = None,
+) -> IndexSummary:
     scoped_settings = settings_for_workspace_name(settings, workspace)
     summary = IndexSummary(workspace=workspace)
     init_db(db_path)
+    active_embedding_client = embedding_client
+    if active_embedding_client is None and settings.embeddings.enabled:
+        active_embedding_client = OllamaEmbeddingClient(settings)
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -231,15 +287,20 @@ def index_workspace(settings: Settings, workspace: str, db_path: Path = DB_PATH)
                 if existing and existing["content_hash"] == content_hash:
                     summary.skipped_unchanged_count += 1
                     continue
-                chunks_created = _replace_indexed_file(
+                chunks_created, embeddings_created, embeddings_skipped, embedding_errors = _replace_indexed_file(
                     conn,
                     workspace=workspace,
                     path=path,
                     text=text,
                     content_hash=content_hash,
+                    settings=settings,
+                    embedding_client=active_embedding_client,
                 )
                 summary.indexed_file_count += 1
                 summary.total_chunks_created += chunks_created
+                summary.embeddings_created += embeddings_created
+                summary.embeddings_skipped += embeddings_skipped
+                summary.embedding_errors.extend(embedding_errors)
             except (OSError, SafetyError, UnicodeError) as exc:
                 summary.rejected_file_count += 1
                 summary.errors.append(f"{candidate}: {exc}")
@@ -275,6 +336,17 @@ def _needs_grounded_fallback(answer: str) -> bool:
         or "official documentation" in lowered
         or "research papers" in lowered
     )
+
+
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)
 
 
 def search_kb(
@@ -332,6 +404,179 @@ def search_kb(
     ]
 
 
+def semantic_search_kb(
+    *,
+    query: str,
+    workspace: str,
+    settings: Settings,
+    limit: int = 10,
+    db_path: Path = DB_PATH,
+    embedding_client: OllamaEmbeddingClient | None = None,
+    fallback_to_keyword: bool = True,
+) -> SemanticSearchOutcome:
+    settings_for_workspace_name(settings, workspace)
+    if not settings.knowledge_base.semantic_search_enabled or not settings.embeddings.enabled:
+        message = "Semantic search is disabled; using keyword search."
+        results = search_kb(query=query, workspace=workspace, settings=settings, limit=limit, db_path=db_path) if fallback_to_keyword else []
+        return SemanticSearchOutcome(results=results, search_mode_used="keyword", fallback_message=message)
+
+    client = embedding_client or OllamaEmbeddingClient(settings)
+    try:
+        query_vector = client.get_embedding(query)
+    except EmbeddingError as exc:
+        message = f"Semantic search unavailable; using keyword search. {exc}"
+        results = search_kb(query=query, workspace=workspace, settings=settings, limit=limit, db_path=db_path) if fallback_to_keyword else []
+        return SemanticSearchOutcome(results=results, search_mode_used="keyword", fallback_message=message)
+
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                e.vector_json,
+                files.path,
+                files.file_name,
+                c.content,
+                c.id AS chunk_id,
+                files.id AS file_id,
+                c.start_line,
+                c.end_line
+            FROM chunk_embeddings AS e
+            JOIN document_chunks AS c ON c.id = e.chunk_id
+            JOIN indexed_files AS files ON files.id = c.file_id
+            WHERE e.workspace = ?
+              AND e.embedding_model = ?
+            """,
+            (workspace, settings.embeddings.model),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    scored: list[KBSearchResult] = []
+    for row in rows:
+        try:
+            vector = [float(value) for value in json.loads(str(row["vector_json"]))]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        score = cosine_similarity(query_vector, vector)
+        scored.append(
+            KBSearchResult(
+                path=str(row["path"]),
+                file_name=str(row["file_name"]),
+                snippet=str(row["content"])[:700],
+                rank=None,
+                chunk_id=int(row["chunk_id"]),
+                file_id=int(row["file_id"]),
+                start_line=int(row["start_line"]) if row["start_line"] is not None else None,
+                end_line=int(row["end_line"]) if row["end_line"] is not None else None,
+                semantic_score=score,
+            )
+        )
+
+    scored.sort(key=lambda item: item.semantic_score or 0.0, reverse=True)
+    return SemanticSearchOutcome(
+        results=scored[: max(1, min(limit, 50))],
+        search_mode_used="semantic",
+    )
+
+
+def _normalize_keyword_scores(results: list[KBSearchResult]) -> dict[int, float]:
+    if not results:
+        return {}
+    raw_scores = [1.0 / (1.0 + max(result.rank or 0.0, 0.0)) for result in results]
+    max_score = max(raw_scores) or 1.0
+    return {result.chunk_id: score / max_score for result, score in zip(results, raw_scores)}
+
+
+def _normalize_semantic_scores(results: list[KBSearchResult]) -> dict[int, float]:
+    if not results:
+        return {}
+    min_score = min(result.semantic_score or 0.0 for result in results)
+    max_score = max(result.semantic_score or 0.0 for result in results)
+    if max_score == min_score:
+        return {result.chunk_id: 1.0 for result in results}
+    return {
+        result.chunk_id: ((result.semantic_score or 0.0) - min_score) / (max_score - min_score)
+        for result in results
+    }
+
+
+def hybrid_search_kb(
+    *,
+    query: str,
+    workspace: str,
+    settings: Settings,
+    limit: int = 10,
+    db_path: Path = DB_PATH,
+    embedding_client: OllamaEmbeddingClient | None = None,
+) -> SemanticSearchOutcome:
+    keyword_results = search_kb(query=query, workspace=workspace, settings=settings, limit=limit, db_path=db_path)
+    if not settings.knowledge_base.hybrid_search_enabled:
+        return SemanticSearchOutcome(results=keyword_results, search_mode_used="keyword")
+
+    semantic_outcome = semantic_search_kb(
+        query=query,
+        workspace=workspace,
+        settings=settings,
+        limit=limit,
+        db_path=db_path,
+        embedding_client=embedding_client,
+        fallback_to_keyword=False,
+    )
+    if semantic_outcome.search_mode_used != "semantic":
+        return SemanticSearchOutcome(
+            results=keyword_results,
+            search_mode_used="keyword",
+            fallback_message=semantic_outcome.fallback_message,
+        )
+
+    keyword_scores = _normalize_keyword_scores(keyword_results)
+    semantic_scores = _normalize_semantic_scores(semantic_outcome.results)
+    merged: dict[int, KBSearchResult] = {}
+    for result in keyword_results + semantic_outcome.results:
+        existing = merged.get(result.chunk_id)
+        if existing is None:
+            merged[result.chunk_id] = result
+            continue
+        merged[result.chunk_id] = KBSearchResult(
+            path=existing.path,
+            file_name=existing.file_name,
+            snippet=existing.snippet,
+            rank=existing.rank if existing.rank is not None else result.rank,
+            chunk_id=existing.chunk_id,
+            file_id=existing.file_id,
+            start_line=existing.start_line,
+            end_line=existing.end_line,
+            semantic_score=existing.semantic_score if existing.semantic_score is not None else result.semantic_score,
+        )
+
+    combined: list[KBSearchResult] = []
+    for chunk_id, result in merged.items():
+        score = 0.5 * keyword_scores.get(chunk_id, 0.0) + 0.5 * semantic_scores.get(chunk_id, 0.0)
+        combined.append(
+            KBSearchResult(
+                path=result.path,
+                file_name=result.file_name,
+                snippet=result.snippet,
+                rank=result.rank,
+                chunk_id=result.chunk_id,
+                file_id=result.file_id,
+                start_line=result.start_line,
+                end_line=result.end_line,
+                semantic_score=result.semantic_score,
+                combined_score=score,
+            )
+        )
+
+    combined.sort(key=lambda item: item.combined_score or 0.0, reverse=True)
+    return SemanticSearchOutcome(
+        results=combined[: max(1, min(limit, 50))],
+        search_mode_used="hybrid",
+    )
+
+
 async def ask_kb(
     *,
     question: str,
@@ -340,8 +585,22 @@ async def ask_kb(
     llm: OllamaClient,
     limit: int = 5,
     db_path: Path = DB_PATH,
+    embedding_client: OllamaEmbeddingClient | None = None,
 ) -> KBAnswer:
-    results = search_kb(query=question, workspace=workspace, settings=settings, limit=limit, db_path=db_path)
+    if settings.knowledge_base.hybrid_search_enabled:
+        search_outcome = hybrid_search_kb(
+            query=question,
+            workspace=workspace,
+            settings=settings,
+            limit=limit,
+            db_path=db_path,
+            embedding_client=embedding_client,
+        )
+        results = search_outcome.results
+        search_mode_used = search_outcome.search_mode_used
+    else:
+        results = search_kb(query=question, workspace=workspace, settings=settings, limit=limit, db_path=db_path)
+        search_mode_used = "keyword"
     context_parts: list[str] = []
     used_results: list[KBSearchResult] = []
     total_chars = 0
@@ -364,6 +623,7 @@ async def ask_kb(
             answer="I could not find an answer in the indexed local knowledge base.",
             sources_used=[],
             context_limited=False,
+            search_mode_used=search_mode_used,
         )
 
     prompt = (
@@ -380,4 +640,9 @@ async def ask_kb(
     answer = await llm.chat(prompt)
     if used_results and _needs_grounded_fallback(answer):
         answer = _fallback_answer(question, used_results)
-    return KBAnswer(answer=answer, sources_used=used_results, context_limited=context_limited)
+    return KBAnswer(
+        answer=answer,
+        sources_used=used_results,
+        context_limited=context_limited,
+        search_mode_used=search_mode_used,
+    )

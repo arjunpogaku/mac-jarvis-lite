@@ -12,7 +12,8 @@ from backend.config import PROJECT_ROOT
 DB_PATH = PROJECT_ROOT / "data" / "jarvis.sqlite"
 
 
-def init_db(db_path: Path = DB_PATH) -> None:
+def init_db(db_path: Path | None = None) -> None:
+    db_path = db_path or DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -73,10 +74,117 @@ def init_db(db_path: Path = DB_PATH) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chunk_embeddings (
+                chunk_id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                workspace TEXT NOT NULL,
+                embedding_model TEXT NOT NULL,
+                vector_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(chunk_id) REFERENCES document_chunks(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_summaries (
+                file_id INTEGER PRIMARY KEY,
+                workspace TEXT NOT NULL,
+                path TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                short_summary TEXT,
+                key_points TEXT,
+                detected_topics TEXT,
+                possible_actions TEXT,
+                warnings TEXT,
+                model TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(file_id) REFERENCES indexed_files(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workspace_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace TEXT NOT NULL,
+                indexed_file_count INTEGER NOT NULL,
+                limit_files INTEGER NOT NULL,
+                source_hash TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                main_topics TEXT,
+                important_files TEXT,
+                possible_actions TEXT,
+                warnings TEXT,
+                model TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS project_dashboards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace TEXT NOT NULL,
+                project_type TEXT NOT NULL,
+                title TEXT,
+                overview TEXT,
+                status TEXT,
+                main_topics TEXT,
+                risks TEXT,
+                next_actions TEXT,
+                sources_used TEXT,
+                model TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS project_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                source_path TEXT,
+                source_line_start INTEGER,
+                source_line_end INTEGER,
+                category TEXT,
+                priority TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                evidence TEXT,
+                created_by TEXT NOT NULL DEFAULT 'jarvis',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS command_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                workspace TEXT,
+                user_message TEXT NOT NULL,
+                intent TEXT,
+                agent TEXT,
+                plan_json TEXT,
+                approved INTEGER NOT NULL DEFAULT 0,
+                executed INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
 
 
 @contextmanager
-def get_connection(db_path: Path = DB_PATH) -> Iterator[sqlite3.Connection]:
+def get_connection(db_path: Path | None = None) -> Iterator[sqlite3.Connection]:
+    db_path = db_path or DB_PATH
     init_db(db_path)
     conn = sqlite3.connect(db_path)
     try:
